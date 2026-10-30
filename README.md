@@ -1,5 +1,8 @@
 # opencode Pane
 
+[![build](https://github.com/explainpark101/opencode-pane/actions/workflows/build.yml/badge.svg)](https://github.com/explainpark101/opencode-pane/actions/workflows/build.yml)
+[![release](https://github.com/explainpark101/opencode-pane/actions/workflows/release.yml/badge.svg)](https://github.com/explainpark101/opencode-pane/actions/workflows/release.yml)
+
 opencode의 **공식 웹 UI**를 Cursor의 사이드 패널에 도킹하는 로컬 확장입니다.
 터미널 pane 대신, `opencode serve`가 제공하는 웹 UI를 Webview 안에 iframe으로 넣습니다.
 
@@ -20,11 +23,17 @@ Cursor 오른쪽 패널 (WebviewView)
 
 ## 설치
 
+릴리즈 페이지에서 최신 `.vsix`를 받아 설치하거나, 로컬에서 직접 빌드합니다.
+
 ```powershell
+# 릴리즈에서 받은 파일 설치
+cursor --install-extension opencode-pane-0.2.0.vsix --force
+
+# 또는 로컬 빌드
 npm install
 npm run build
 npm run package
-cursor --install-extension opencode-pane-0.2.0.vsix --force
+cursor --install-extension opencode-pane-0.2.1.vsix --force
 ```
 
 설치 후 Cursor를 reload 합니다. (`Developer: Reload Window`)
