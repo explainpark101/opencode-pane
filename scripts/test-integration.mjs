@@ -45,17 +45,21 @@ function assertEquals(actual, expected, label) {
   }
 }
 
-function bundle(entry, outfile, extra = []) {
-  const esbuild = path.join(process.cwd(), 'node_modules', 'esbuild', 'bin', 'esbuild');
-  execFileSync(
-    process.execPath,
-    [esbuild, entry, '--bundle', '--format=esm', '--platform=node', `--outfile=${outfile}`, ...extra],
-    { stdio: 'pipe', windowsHide: true },
-  );
+async function bundle(entry, outfile, options = {}) {
+  const { build } = await import('esbuild');
+  await build({
+    entryPoints: [entry],
+    bundle: true,
+    platform: 'node',
+    format: options.format ?? 'esm',
+    outfile,
+    external: options.external ?? [],
+    logLevel: 'silent',
+  });
 }
 
 fs.mkdirSync(buildDir, { recursive: true });
-bundle('src/patch.ts', path.join(buildDir, 'patch.mjs'));
+await bundle('src/patch.ts', path.join(buildDir, 'patch.mjs'));
 const { reverseApply } = await import(pathToFileURL(path.join(buildDir, 'patch.mjs')).href);
 
 check('reverse-apply a single modified hunk', () => {
@@ -116,7 +120,7 @@ check('reverse-apply rejects a patch that does not match', () => {
 if (skipApi) {
   console.log('[test] api checks skipped');
 } else {
-  bundle('src/api.ts', path.join(buildDir, 'api.mjs'));
+  await bundle('src/api.ts', path.join(buildDir, 'api.mjs'));
   const { OpencodeApi } = await import(pathToFileURL(path.join(buildDir, 'api.mjs')).href);
 
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-pane-api-'));
@@ -129,7 +133,6 @@ if (skipApi) {
     env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    shell: process.platform === 'win32',
   });
 
   const cleanup = () => {
@@ -201,7 +204,7 @@ if (skipApi) {
   const { createRequire } = await import('node:module');
   const requireCjs = createRequire(import.meta.url);
 
-  bundle('src/review.ts', path.join(buildDir, 'review.cjs'), ['--format=cjs', '--external:vscode']);
+  await bundle('src/review.ts', path.join(buildDir, 'review.cjs'), { format: 'cjs', external: ['vscode'] });
 
   const diffCalls = [];
   const notices = [];
