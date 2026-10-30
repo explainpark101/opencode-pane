@@ -1,0 +1,210 @@
+{
+  "name": "opencode-pane",
+  "displayName": "opencode Pane",
+  "description": "Dock the official opencode web UI in a Cursor sidebar pane.",
+  "version": "0.2.0",
+  "publisher": "local",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "opencode",
+    "cursor",
+    "ai",
+    "agent"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node scripts/test-integration.mjs && node scripts/harness.cjs",
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencodePaneContainer",
+          "title": "opencode",
+          "icon": "media/opencode.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencodePaneContainer": [
+        {
+          "id": "opencode-pane.view",
+          "type": "webview",
+          "name": "opencode",
+          "icon": "media/opencode.svg",
+          "contextualTitle": "opencode"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "opencode-pane.open",
+        "title": "Open opencode Pane",
+        "category": "opencode",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "opencode-pane.restartServer",
+        "title": "Restart opencode Server",
+        "category": "opencode",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "opencode-pane.newSession",
+        "title": "New Session in Current Project",
+        "category": "opencode",
+        "icon": "$(add)"
+      },
+      {
+        "command": "opencode-pane.attachSelection",
+        "title": "Attach Current File / Selection",
+        "category": "opencode",
+        "icon": "$(reference)"
+      },
+      {
+        "command": "opencode-pane.reviewChanges",
+        "title": "Review Changes in Editor",
+        "category": "opencode",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "opencode-pane.stopServer",
+        "title": "Stop opencode Server",
+        "category": "opencode",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "opencode-pane.showLogs",
+        "title": "Show Logs",
+        "category": "opencode"
+      },
+      {
+        "command": "opencode-pane.openInBrowser",
+        "title": "Open Web UI in Browser",
+        "category": "opencode",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "opencode-pane.openTuiInTerminal",
+        "title": "Open TUI in Terminal",
+        "category": "opencode",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "opencode-pane.openSettings",
+        "title": "Open Settings",
+        "category": "opencode",
+        "icon": "$(gear)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "opencode-pane.newSession",
+          "when": "view == opencode-pane.view",
+          "group": "navigation@0"
+        },
+        {
+          "command": "opencode-pane.restartServer",
+          "when": "view == opencode-pane.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "opencode-pane.reviewChanges",
+          "when": "view == opencode-pane.view",
+          "group": "navigation@2"
+        },
+        {
+          "command": "opencode-pane.openInBrowser",
+          "when": "view == opencode-pane.view",
+          "group": "navigation@3"
+        },
+        {
+          "command": "opencode-pane.openSettings",
+          "when": "view == opencode-pane.view",
+          "group": "navigation@4"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "opencode-pane.attachSelection",
+          "when": "editorTextFocus",
+          "group": "opencode@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "opencode-pane.openTuiInTerminal",
+          "when": "workspaceFolderCount > 0"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "opencode-pane.open",
+        "key": "ctrl+alt+o",
+        "mac": "cmd+alt+o"
+      },
+      {
+        "command": "opencode-pane.newSession",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n"
+      },
+      {
+        "command": "opencode-pane.attachSelection",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "opencode-pane.reviewChanges",
+        "key": "ctrl+alt+d",
+        "mac": "cmd+alt+d"
+      }
+    ],
+    "configuration": {
+      "title": "opencode Pane",
+      "properties": {
+        "opencode-pane.executablePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the `opencode` executable. Leave empty to resolve it from `PATH`."
+        },
+        "opencode-pane.port": {
+          "type": "number",
+          "default": 47821,
+          "minimum": 0,
+          "maximum": 65535,
+          "markdownDescription": "Preferred localhost port for `opencode serve`. `0` picks a random free port. If the preferred port is busy, a random port is used."
+        },
+        "opencode-pane.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra arguments appended to `opencode serve --port <port> --hostname 127.0.0.1`."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.2"
+  }
+}
