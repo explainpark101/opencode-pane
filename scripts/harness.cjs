@@ -52,9 +52,12 @@ const providers = new Map();
 const statusItems = [];
 const terminals = [];
 const messages = [];
+const posted = [];
 const globalState = new Map();
 const secrets = new Map();
 const clipboard = [];
+let webviewMessageHandler;
+const workspaceEmitter = new Emitter();
 
 const Uri = {
   file(p) {
@@ -114,7 +117,7 @@ const vscodeMock = {
         },
       };
     },
-    onDidChangeWorkspaceFolders: new Emitter().event,
+    onDidChangeWorkspaceFolders: workspaceEmitter.event,
   },
   window: {
     activeTextEditor: undefined,
@@ -228,7 +231,19 @@ function fail(message) {
   const webview = {
     options: {},
     html: '',
-    onDidReceiveMessage: () => disposable(),
+    onDidReceiveMessage(handler) {
+      webviewMessageHandler = handler;
+      return disposable();
+    },
+    postMessage(message) {
+      posted.push(message);
+      if (message && message.type === 'attach-text' && message.requestId) {
+        setTimeout(() => {
+          webviewMessageHandler?.({ type: 'inserted', requestId: message.requestId });
+        }, 10);
+      }
+      return Promise.resolve(true);
+    },
   };
   const view = {
     webview,
@@ -290,7 +305,23 @@ function fail(message) {
   const html = await page.text();
   if (!page.ok) fail(`web UI returned ${page.status}`);
   if (!/OpenCode/i.test(html)) fail('web UI HTML does not look like opencode');
-  console.log(`[harness] web UI: HTTP ${page.status}, ${html.length} bytes`);
+  if (!html.includes('/__opencode-pane/bridge.js')) fail('proxy did not inject the bridge script');
+  console.log(`[harness] web UI: HTTP ${page.status}, ${html.length} bytes (bridge injected)`);
+
+  const bridge = await fetch(`${parsed.origin}/__opencode-pane/bridge.js`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  const bridgeText = await bridge.text();
+  if (!bridge.ok) fail(`bridge script returned ${bridge.status}`);
+  if (!bridgeText.includes('opencode-pane-bridge')) fail('bridge script content is wrong');
+  console.log(`[harness] bridge script: HTTP ${bridge.status}, ${bridgeText.length} bytes`);
+
+  const proxyLine = logs.find((line) => line.startsWith('[proxy]') && line.includes('->'));
+  if (!proxyLine) fail('proxy did not log its upstream');
+  const upstreamMatch = /-> http:\/\/127\.0\.0\.1:(\d+)/.exec(proxyLine);
+  if (!upstreamMatch) fail(`could not parse proxy upstream from ${JSON.stringify(proxyLine)}`);
+  const upstreamPort = Number(upstreamMatch[1]);
+  if (upstreamPort === port) fail('proxy and opencode server share a port');
 
   const password = secrets.get('opencode-pane.serverPassword');
   if (!password) fail('password was not stored in SecretStorage');
@@ -300,7 +331,11 @@ function fail(message) {
   if (statusItems.length === 0) fail('status bar item was not created');
   console.log(`[harness] status bar: ${statusItems[0].text}`);
 
-  if (!(await isPortOpen(port))) fail('server is not listening');
+  if (!(await isPortOpen(port))) fail('proxy is not listening');
+  if (!(await isPortOpen(upstreamPort))) fail('opencode server is not listening');
+
+  if (typeof webviewMessageHandler !== 'function') fail('webview message handler was not registered');
+  webviewMessageHandler({ type: 'bridge-ready', path: '/', source: 'opencode-pane-bridge' });
 
   // --- editor integration -------------------------------------------------
   vscodeMock.window.activeTextEditor = {
@@ -311,20 +346,79 @@ function fail(message) {
   const mention = clipboard.at(-1);
   const expected = '@src/example.ts#L2-5';
   if (mention !== expected) fail(`attachSelection wrote ${JSON.stringify(mention)}, expected ${JSON.stringify(expected)}`);
-  console.log(`[harness] attachSelection: ${mention}`);
+  const sent = posted.at(-1);
+  if (!sent || sent.type !== 'attach-text' || sent.text !== expected) {
+    fail(`attachSelection did not insert into the bridge: ${JSON.stringify(sent)}`);
+  }
+  console.log(`[harness] attachSelection: ${mention} (inserted via bridge)`);
 
   vscodeMock.window.activeTextEditor.selection = { isEmpty: true, start: { line: 0 }, end: { line: 0 } };
   await commands.get('opencode-pane.attachSelection')();
   if (clipboard.at(-1) !== '@src/example.ts') fail(`single-line attach wrote ${JSON.stringify(clipboard.at(-1))}`);
+  if (posted.at(-1)?.text !== '@src/example.ts') fail('single-line attach was not inserted via bridge');
   console.log('[harness] attachSelection (no selection): @src/example.ts');
 
   await commands.get('opencode-pane.newSession')();
   const routedMatch = /<iframe src="([^"]+)"/.exec(webview.html);
   if (!routedMatch) fail('iframe missing after newSession');
   const routedSrc = routedMatch[1].replace(/&amp;/g, '&');
-  if (!/\/new-session\?auth_token=/.test(routedSrc)) fail(`newSession did not navigate the iframe: ${routedSrc}`);
+  if (!/\/server\/[^/]+\/session\/[^/?]+\?auth_token=/.test(routedSrc)) {
+    fail(`newSession did not navigate to a session: ${routedSrc}`);
+  }
   if (!/frame-src http:\/\/127\.0\.0\.1:\d+/.test(webview.html)) fail('CSP frame-src broken after navigation');
   console.log(`[harness] newSession route: ${routedSrc.replace(/auth_token=.*/, 'auth_token=<redacted>')}`);
+
+  webviewMessageHandler({ type: 'route', path: new URL(routedSrc).pathname, source: 'opencode-pane-bridge' });
+
+  // A drop from the Explorer goes through the bridge -> attachPaths -> composer.
+  const beforeDrop = posted.length;
+  webviewMessageHandler({
+    type: 'drop',
+    paths: [path.join(workspaceDir, 'src', 'example.ts')],
+    source: 'opencode-pane-bridge',
+  });
+  const dropDeadline = Date.now() + 5000;
+  while (posted.length === beforeDrop && Date.now() < dropDeadline) {
+    await delay(50);
+  }
+  const dropped = posted.at(-1);
+  if (!dropped || dropped.type !== 'attach-text' || dropped.text !== '@src/example.ts') {
+    fail(`drop did not attach the file: ${JSON.stringify(dropped)}`);
+  }
+  console.log('[harness] drag/drop: @src/example.ts inserted via bridge');
+
+  // A shortcut captured inside the iframe is forwarded to the extension command.
+  const beforeShortcut = /<iframe src="([^"]+)"/.exec(webview.html)?.[1];
+  webviewMessageHandler({ type: 'shortcut', command: 'new-session', source: 'opencode-pane-bridge' });
+  const shortcutDeadline = Date.now() + 15_000;
+  let shortcutSrc = beforeShortcut;
+  while (Date.now() < shortcutDeadline) {
+    shortcutSrc = /<iframe src="([^"]+)"/.exec(webview.html)?.[1];
+    if (shortcutSrc && shortcutSrc !== beforeShortcut) break;
+    await delay(100);
+  }
+  if (!shortcutSrc || shortcutSrc === beforeShortcut) fail('bridge shortcut did not run newSession');
+  console.log('[harness] bridge shortcut: new-session handled');
+
+  // A workspace change restarts the server and reloads the UI with a reset
+  // nonce so the bridge clears the previous project's stored route.
+  const nextWorkspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-pane-harness-next-'));
+  const beforeWorkspace = /<iframe src="([^"]+)"/.exec(webview.html)?.[1];
+  vscodeMock.workspace.workspaceFolders = [
+    { uri: Uri.file(nextWorkspaceDir), name: path.basename(nextWorkspaceDir), index: 0 },
+  ];
+  workspaceEmitter.fire({ added: [], removed: [] });
+  const workspaceDeadline = Date.now() + 90_000;
+  let workspaceSrc;
+  while (Date.now() < workspaceDeadline) {
+    workspaceSrc = /<iframe src="([^"]+)"/.exec(webview.html)?.[1];
+    if (workspaceSrc && workspaceSrc !== beforeWorkspace && /ocp_reset=/.test(workspaceSrc)) break;
+    await delay(200);
+  }
+  if (!workspaceSrc || workspaceSrc === beforeWorkspace || !/ocp_reset=/.test(workspaceSrc)) {
+    fail(`workspace change did not reload with a reset nonce: ${workspaceSrc}`);
+  }
+  console.log('[harness] workspace change: server restarted and iframe reloaded with ocp_reset');
 
   await extension.deactivate();
   await delay(500);
@@ -336,14 +430,20 @@ function fail(message) {
     }
   }
 
-  if (await isPortOpen(port)) fail('server still listening after deactivate()');
-  console.log('[harness] server stopped after deactivate()');
+  if (await isPortOpen(port)) fail('proxy still listening after deactivate()');
+  if (await isPortOpen(upstreamPort)) fail('opencode server still listening after deactivate()');
+  console.log('[harness] proxy and server stopped after deactivate()');
 
   if (messages.some((m) => /could not|failed|error/i.test(m))) {
     fail(`unexpected error message: ${messages.join(' | ')}`);
   }
 
   fs.rmSync(workspaceDir, { recursive: true, force: true });
+  try {
+    fs.rmSync(nextWorkspaceDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch {
+    // The stopped server may still hold its old working directory briefly.
+  }
   console.log('[harness] ok');
 })().catch((error) => {
   console.error(error);

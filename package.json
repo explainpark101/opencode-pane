@@ -2,7 +2,7 @@
   "name": "opencode-pane",
   "displayName": "opencode Pane",
   "description": "Dock the official opencode web UI in a Cursor sidebar pane.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "local",
   "license": "MIT",
   "private": true,
@@ -165,8 +165,7 @@
       {
         "command": "opencode-pane.attachSelection",
         "key": "ctrl+alt+k",
-        "mac": "cmd+alt+k",
-        "when": "editorTextFocus"
+        "mac": "cmd+alt+k"
       },
       {
         "command": "opencode-pane.reviewChanges",

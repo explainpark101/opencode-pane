@@ -288,6 +288,166 @@ if (skipApi) {
   });
 }
 
+// --- proxy: transparent forwarding, HTML bridge injection, websocket tunnel --
+{
+  const http = await import('node:http');
+  const zlib = await import('node:zlib');
+
+  const upstream = http.createServer((request, response) => {
+    const url = request.url ?? '/';
+    if (url === '/html-gzip') {
+      const body = zlib.gzipSync(
+        Buffer.from('<html><head><title>OpenCode</title></head><body>app</body></html>'),
+      );
+      response.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-encoding': 'gzip',
+      });
+      response.end(body);
+      return;
+    }
+    if (url === '/') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end('<html><head><title>OpenCode</title></head><body>app</body></html>');
+      return;
+    }
+    if (url === '/asset.js') {
+      response.writeHead(200, { 'content-type': 'text/javascript' });
+      response.end('console.log("asset")');
+      return;
+    }
+    response.writeHead(404, { 'content-type': 'text/plain' });
+    response.end('missing');
+  });
+
+  const upgradedSockets = new Set();
+  upstream.on('upgrade', (_request, socket) => {
+    upgradedSockets.add(socket);
+    socket.once('close', () => upgradedSockets.delete(socket));
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
+    );
+    socket.on('data', (chunk) => {
+      if (chunk.toString() === 'ping') {
+        socket.write('pong');
+      }
+    });
+  });
+
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const address = upstream.address();
+  const upstreamPort = typeof address === 'object' && address ? address.port : 0;
+  if (!upstreamPort) throw new Error('could not start the mock upstream server');
+
+  await bundle('src/proxy.ts', path.join(buildDir, 'proxy.mjs'));
+  const { OpencodeProxy, BRIDGE_PATH } = await import(
+    pathToFileURL(path.join(buildDir, 'proxy.mjs')).href
+  );
+
+  const info = {
+    url: `http://127.0.0.1:${upstreamPort}`,
+    port: upstreamPort,
+    password: 'probe-password',
+    authToken: Buffer.from('opencode:probe-password', 'utf8').toString('base64url'),
+    cwd: process.cwd(),
+  };
+  const logs = [];
+  const proxy = new OpencodeProxy(
+    info,
+    { appendLine: (line) => logs.push(line) },
+    'window.__opencodePaneBridge = true;',
+  );
+
+  const proxyUrl = await proxy.start();
+  const proxyPort = Number(new URL(proxyUrl).port);
+
+  try {
+    await runCheck('proxy: injects the bridge into HTML', async () => {
+      const response = await fetch(`${proxyUrl}/`);
+      const html = await response.text();
+      assertEquals(response.status, 200, 'status');
+      if (!html.includes(`<script src="${BRIDGE_PATH}"></script>`)) {
+        throw new Error('bridge script tag is missing');
+      }
+      if (html.indexOf(BRIDGE_PATH) > html.indexOf('</head>')) {
+        throw new Error('bridge script tag was not injected before </head>');
+      }
+    });
+
+    await runCheck('proxy: serves the injected bridge script', async () => {
+      const response = await fetch(`${proxyUrl}${BRIDGE_PATH}`);
+      const body = await response.text();
+      assertEquals(response.status, 200, 'status');
+      if (!body.includes('__opencodePaneBridge')) throw new Error('bridge body is wrong');
+      assertEquals(response.headers.get('cache-control'), 'no-store', 'cache-control');
+    });
+
+    await runCheck('proxy: forwards assets unchanged', async () => {
+      const response = await fetch(`${proxyUrl}/asset.js`);
+      const body = await response.text();
+      assertEquals(response.status, 200, 'status');
+      assertEquals(body, 'console.log("asset")', 'asset body');
+      if (!/javascript/.test(response.headers.get('content-type') ?? '')) {
+        throw new Error(`unexpected content-type: ${response.headers.get('content-type')}`);
+      }
+    });
+
+    await runCheck('proxy: decodes compressed HTML before injecting', async () => {
+      const response = await fetch(`${proxyUrl}/html-gzip`);
+      const html = await response.text();
+      assertEquals(response.status, 200, 'status');
+      if (!html.includes(BRIDGE_PATH)) throw new Error('bridge missing from compressed HTML');
+      assertEquals(response.headers.get('content-encoding'), null, 'content-encoding');
+    });
+
+    await runCheck('proxy: forwards upstream errors', async () => {
+      const response = await fetch(`${proxyUrl}/missing`);
+      assertEquals(response.status, 404, 'status');
+      assertEquals(await response.text(), 'missing', 'body');
+    });
+
+    await runCheck('proxy: tunnels websocket upgrades', async () => {
+      const echoed = await new Promise((resolve, reject) => {
+        const request = http.request(`${proxyUrl}/socket`, {
+          headers: { Connection: 'Upgrade', Upgrade: 'websocket' },
+        });
+        request.on('upgrade', (_response, socket) => {
+          socket.write('ping');
+          socket.once('data', (chunk) => {
+            resolve(chunk.toString());
+            socket.destroy();
+          });
+        });
+        request.on('error', reject);
+        request.end();
+      });
+      assertEquals(echoed, 'pong', 'upgraded socket echo');
+    });
+  } finally {
+    await proxy.stop();
+    for (const socket of upgradedSockets) {
+      socket.destroy();
+    }
+    upstream.closeAllConnections?.();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+
+  await runCheck('proxy: stops listening after stop()', async () => {
+    let listening = true;
+    try {
+      await fetch(`${proxyUrl}/`, { signal: AbortSignal.timeout(1_000) });
+    } catch {
+      listening = false;
+    }
+    assertEquals(listening, false, 'proxy port');
+    if (logs.length === 0) throw new Error('proxy did not log anything');
+    if (logs.some((line) => line.includes('probe-password'))) {
+      throw new Error('proxy logged the server password');
+    }
+    if (!(proxyPort > 0)) throw new Error('proxy did not allocate a port');
+  });
+}
+
 fs.rmSync(buildDir, { recursive: true, force: true });
 
 const failed = checks.filter((entry) => !entry.ok);

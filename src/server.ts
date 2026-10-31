@@ -191,7 +191,7 @@ export class OpencodeServer implements vscode.Disposable {
   private child?: ChildProcess;
   private info?: ServerInfo;
   private snapshot: ServerSnapshot = { status: 'stopped' };
-  private pending?: Promise<ServerInfo>;
+  private lifecycle: Promise<unknown> = Promise.resolve();
   private generation = 0;
   private disposed = false;
   private lastCwd?: string;
@@ -210,23 +210,34 @@ export class OpencodeServer implements vscode.Disposable {
     return this.lastCwd;
   }
 
-  async start(): Promise<ServerInfo> {
+  private runLifecycle<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.lifecycle.then(task, task);
+    this.lifecycle = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  start(): Promise<ServerInfo> {
+    return this.runLifecycle(() => this.startInner());
+  }
+
+  private async startInner(): Promise<ServerInfo> {
     if (this.disposed) {
       throw new Error('opencode server manager is disposed.');
     }
     if (this.info) {
       return this.info;
     }
-    if (this.pending) {
-      return this.pending;
-    }
-    this.pending = this.launch().finally(() => {
-      this.pending = undefined;
-    });
-    return this.pending;
+    return this.launch();
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    return this.runLifecycle(() => this.stopInner());
+  }
+
+  private async stopInner(): Promise<void> {
     this.generation += 1;
     const child = this.child;
     this.child = undefined;
@@ -244,9 +255,11 @@ export class OpencodeServer implements vscode.Disposable {
     }
   }
 
-  async restart(): Promise<ServerInfo> {
-    await this.stop();
-    return this.start();
+  restart(): Promise<ServerInfo> {
+    return this.runLifecycle(async () => {
+      await this.stopInner();
+      return this.startInner();
+    });
   }
 
   private setState(snapshot: ServerSnapshot): void {

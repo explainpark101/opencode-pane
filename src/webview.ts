@@ -1,12 +1,32 @@
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as vscode from 'vscode';
+import { OpencodeProxy } from './proxy';
 import type { OpencodeServer, ServerInfo, ServerSnapshot } from './server';
 
 const DRAG_HINT_KEY = 'opencode-pane.dragHintShown';
+const ATTACH_TIMEOUT_MS = 10_000;
 
 interface WebviewMessage {
   type?: string;
+  source?: string;
+  command?: string;
+  text?: string;
+  requestId?: string;
+  path?: string;
+  reason?: string;
+  paths?: unknown;
+}
+
+interface QueuedAttach {
+  text: string;
+  resolve: (inserted: boolean) => void;
+}
+
+interface ActiveAttach extends QueuedAttach {
+  requestId: string;
+  timer: NodeJS.Timeout;
 }
 
 function escapeHtml(value: string): string {
@@ -18,9 +38,18 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
-function iframeUrl(info: ServerInfo, route: string | undefined): string {
+function iframeUrl(
+  proxyUrl: string,
+  info: ServerInfo,
+  route: string | undefined,
+  reset: string | undefined,
+): string {
   const path = route && route.startsWith('/') ? route : '/';
-  return `${info.url}${path}?auth_token=${encodeURIComponent(info.authToken)}`;
+  const params = new URLSearchParams({ auth_token: info.authToken });
+  if (reset) {
+    params.set('ocp_reset', reset);
+  }
+  return `${proxyUrl}${path}?${params.toString()}`;
 }
 
 function defaultCwd(): string {
@@ -44,10 +73,26 @@ function signature(snapshot: ServerSnapshot): string {
 export class OpencodeViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'opencode-pane.view';
 
+  private readonly dropEmitter = new vscode.EventEmitter<string[]>();
+  readonly onDidDrop = this.dropEmitter.event;
+
   private view?: vscode.WebviewView;
   private renderedKey?: string;
   private route?: string;
   private routeUrl?: string;
+  private currentPath?: string;
+  private resetNonce?: string;
+  private bridgeReady = false;
+
+  private proxy?: OpencodeProxy;
+  private proxyUrl?: string;
+  private proxyInfoUrl?: string;
+  private proxyPromise?: Promise<string>;
+
+  private attachQueue: QueuedAttach[] = [];
+  private activeAttach?: ActiveAttach;
+  private snapshotQueue: Promise<void> = Promise.resolve();
+
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(
@@ -57,33 +102,68 @@ export class OpencodeViewProvider implements vscode.WebviewViewProvider {
   ) {
     this.disposables.push(
       this.server.onDidChange((snapshot) => {
-        if (snapshot.status === 'ready') {
-          if (this.routeUrl && this.routeUrl !== snapshot.info.url) {
-            this.route = undefined;
-          }
-          this.routeUrl = snapshot.info.url;
-        } else {
-          this.route = undefined;
-          this.routeUrl = undefined;
-        }
-        this.render(snapshot);
+        void this.handleSnapshot(snapshot);
       }),
     );
   }
 
   /**
-   * Navigates the embedded web UI to a route such as `/new-session` by reloading the
-   * iframe with the auth token. Only meaningful once the server is ready.
+   * Navigates the embedded web UI to a route such as a session URL by
+   * reloading the iframe with a fresh auth token. Only meaningful once the
+   * server is ready.
    */
-  showRoute(route: string): void {
+  showRoute(route: string): Promise<void> {
     this.route = route;
+    this.resetNonce = undefined;
     this.renderedKey = undefined;
-    this.render(this.server.state);
+    return this.renderCurrent();
+  }
+
+  /**
+   * Opens a session in the embedded UI. The route's server key must match the
+   * origin the UI sees, which is the local proxy rather than `opencode serve`.
+   */
+  async showSession(info: ServerInfo, sessionID: string): Promise<void> {
+    await this.ensureProxy(info);
+    const base = this.proxyUrl ?? info.url;
+    const key = Buffer.from(base, 'utf8').toString('base64url');
+    await this.showRoute(`/server/${key}/session/${encodeURIComponent(sessionID)}`);
+  }
+
+  /** Whether the embedded UI last reported a session route. */
+  hasSessionRoute(): boolean {
+    return !!this.currentPath && /^\/server\/[^/]+\/session\/[^/]+/.test(this.currentPath);
+  }
+
+  /**
+   * Asks the web UI to insert text into its composer. Resolves `false` when
+   * the bridge is unavailable or the composer never appeared.
+   */
+  attachText(text: string): Promise<boolean> {
+    if (!text || !this.view || !this.canPostToBridge()) {
+      return Promise.resolve(false);
+    }
+    return new Promise<boolean>((resolve) => {
+      this.attachQueue.push({ text, resolve });
+      this.pumpAttach();
+    });
+  }
+
+  /**
+   * Resets the embedded UI after the opencode server moved to another project.
+   * The bridge clears stored server/route state before the app boots.
+   */
+  workspaceChanged(): void {
+    this.route = '/';
+    this.resetNonce = crypto.randomBytes(8).toString('hex');
+    this.currentPath = undefined;
+    this.renderedKey = undefined;
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
     this.renderedKey = undefined;
+    this.bridgeReady = false;
 
     view.webview.options = {
       enableScripts: true,
@@ -102,6 +182,8 @@ export class OpencodeViewProvider implements vscode.WebviewViewProvider {
       () => {
         if (this.view === view) {
           this.view = undefined;
+          this.bridgeReady = false;
+          this.requeueActiveAttach();
         }
       },
       undefined,
@@ -118,14 +200,106 @@ export class OpencodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    this.dropEmitter.dispose();
+    void this.stopProxy();
     for (const disposable of this.disposables) {
       disposable.dispose();
     }
     this.disposables.length = 0;
   }
 
+  private handleSnapshot(snapshot: ServerSnapshot): Promise<void> {
+    const task = this.snapshotQueue.then(
+      () => this.applySnapshot(snapshot),
+      () => this.applySnapshot(snapshot),
+    );
+    this.snapshotQueue = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    return task;
+  }
+
+  private async applySnapshot(snapshot: ServerSnapshot): Promise<void> {
+    if (snapshot.status === 'ready') {
+      if (this.routeUrl && this.routeUrl !== snapshot.info.url) {
+        this.route = undefined;
+      }
+      this.routeUrl = snapshot.info.url;
+      try {
+        await this.ensureProxy(snapshot.info);
+      } catch (error) {
+        this.log.appendLine(
+          `[proxy] failed to start: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    } else {
+      this.route = undefined;
+      this.routeUrl = undefined;
+      this.currentPath = undefined;
+      await this.stopProxy();
+    }
+    this.render(snapshot);
+  }
+
+  private async renderCurrent(): Promise<void> {
+    await this.snapshotQueue;
+    const snapshot = this.server.state;
+    if (snapshot.status === 'ready') {
+      try {
+        await this.ensureProxy(snapshot.info);
+      } catch (error) {
+        this.log.appendLine(
+          `[proxy] failed to start: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    this.render(snapshot);
+  }
+
   private async handleMessage(message: WebviewMessage): Promise<void> {
     switch (message?.type) {
+      case 'bridge-ready':
+        this.bridgeReady = true;
+        if (typeof message.path === 'string') {
+          this.currentPath = message.path;
+        }
+        this.pumpAttach();
+        break;
+      case 'route':
+        if (typeof message.path === 'string') {
+          this.currentPath = message.path;
+        }
+        break;
+      case 'shortcut':
+        await this.handleShortcut(message.command);
+        break;
+      case 'drop': {
+        if (!Array.isArray(message.paths)) {
+          break;
+        }
+        const paths = message.paths.filter(
+          (item): item is string => typeof item === 'string' && item.length > 0,
+        );
+        if (paths.length > 0) {
+          this.dropEmitter.fire(paths);
+        }
+        break;
+      }
+      case 'drop-failed':
+        void vscode.window.showWarningMessage(
+          'opencode: dropped files did not include a readable path. Drag them from the Explorer or your file manager.',
+        );
+        break;
+      case 'inserted':
+        this.finishAttach(message.requestId, true);
+        break;
+      case 'insert-failed':
+        this.finishAttach(message.requestId, false);
+        break;
+      case 'storage-reset':
+        this.log.appendLine('[bridge] cleared stored opencode state for the new workspace');
+        break;
       case 'retry':
         try {
           await this.server.restart();
@@ -161,6 +335,27 @@ export class OpencodeViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async handleShortcut(command: string | undefined): Promise<void> {
+    const id =
+      command === 'new-session'
+        ? 'opencode-pane.newSession'
+        : command === 'attach-selection'
+          ? 'opencode-pane.attachSelection'
+          : command === 'review-changes'
+            ? 'opencode-pane.reviewChanges'
+            : undefined;
+    if (!id) {
+      return;
+    }
+    try {
+      await vscode.commands.executeCommand(id);
+    } catch (error) {
+      this.log.appendLine(
+        `[bridge] ${command} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   private async ensureStarted(): Promise<void> {
     if (this.server.state.status !== 'stopped') {
       return;
@@ -180,9 +375,129 @@ export class OpencodeViewProvider implements vscode.WebviewViewProvider {
     }
     await this.context.globalState.update(DRAG_HINT_KEY, true);
     void vscode.window.showInformationMessage(
-      'opencode is running in the sidebar. To dock it, drag the opencode icon from the Activity Bar onto the right sidebar (or right-click it and choose "Move View Container To").',
+      'opencode is running in the sidebar. Drag files from the Explorer into the chat to attach them, or press Ctrl+Alt+K to insert the current file/selection. To dock the pane, drag the opencode icon onto the right sidebar (or right-click it and choose "Move View Container To").',
       'Got it',
     );
+  }
+
+  private canPostToBridge(): boolean {
+    return typeof this.view?.webview.postMessage === 'function';
+  }
+
+  private postToBridge(message: Record<string, unknown>): void {
+    const view = this.view;
+    if (!view || typeof view.webview.postMessage !== 'function') {
+      return;
+    }
+    void Promise.resolve(
+      view.webview.postMessage({ source: 'opencode-pane-host', ...message }),
+    ).catch(() => undefined);
+  }
+
+  private pumpAttach(): void {
+    if (this.activeAttach || this.attachQueue.length === 0) {
+      return;
+    }
+    if (!this.view || !this.bridgeReady || !this.canPostToBridge()) {
+      return;
+    }
+    const next = this.attachQueue.shift();
+    if (!next) {
+      return;
+    }
+    const requestId = crypto.randomBytes(8).toString('hex');
+    const timer = setTimeout(() => this.finishAttach(requestId, false), ATTACH_TIMEOUT_MS);
+    this.activeAttach = { ...next, requestId, timer };
+    this.postToBridge({ type: 'attach-text', text: next.text, requestId });
+  }
+
+  private finishAttach(requestId: string | undefined, inserted: boolean): void {
+    const active = this.activeAttach;
+    if (!active || !requestId || active.requestId !== requestId) {
+      return;
+    }
+    clearTimeout(active.timer);
+    this.activeAttach = undefined;
+    active.resolve(inserted);
+    this.pumpAttach();
+  }
+
+  private requeueActiveAttach(): void {
+    const active = this.activeAttach;
+    if (!active) {
+      return;
+    }
+    clearTimeout(active.timer);
+    this.activeAttach = undefined;
+    this.attachQueue.unshift({ text: active.text, resolve: active.resolve });
+  }
+
+  private async ensureProxy(info: ServerInfo): Promise<string> {
+    if (this.proxy && this.proxyInfoUrl === info.url && this.proxyUrl) {
+      return this.proxyUrl;
+    }
+    if (this.proxyPromise) {
+      await this.proxyPromise.catch(() => undefined);
+      if (this.proxy && this.proxyInfoUrl === info.url && this.proxyUrl) {
+        return this.proxyUrl;
+      }
+    }
+    const task = this.startProxy(info);
+    this.proxyPromise = task;
+    try {
+      return await task;
+    } finally {
+      if (this.proxyPromise === task) {
+        this.proxyPromise = undefined;
+      }
+    }
+  }
+
+  private async startProxy(info: ServerInfo): Promise<string> {
+    const previous = this.proxy;
+    this.proxy = undefined;
+    this.proxyUrl = undefined;
+    this.proxyInfoUrl = undefined;
+    if (previous) {
+      await previous.stop();
+    }
+
+    const script = await this.readBridgeScript();
+    if (!script) {
+      throw new Error('media/bridge.js is missing from the extension bundle.');
+    }
+    const proxy = new OpencodeProxy(info, this.log, script);
+    const url = await proxy.start();
+    this.proxy = proxy;
+    this.proxyUrl = url;
+    this.proxyInfoUrl = info.url;
+    return url;
+  }
+
+  private async stopProxy(): Promise<void> {
+    const task = this.proxyPromise;
+    if (task) {
+      await task.catch(() => undefined);
+    }
+    const proxy = this.proxy;
+    this.proxy = undefined;
+    this.proxyUrl = undefined;
+    this.proxyInfoUrl = undefined;
+    if (proxy) {
+      await proxy.stop();
+    }
+  }
+
+  private async readBridgeScript(): Promise<string> {
+    const file = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'bridge.js');
+    try {
+      return await fs.promises.readFile(file.fsPath, 'utf8');
+    } catch (error) {
+      this.log.appendLine(
+        `[proxy] could not read media/bridge.js: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return '';
+    }
   }
 
   private render(snapshot: ServerSnapshot): void {
@@ -191,18 +506,32 @@ export class OpencodeViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const key = `${signature(snapshot)}|${this.route ?? '/'}`;
+    const proxyUrl = snapshot.status === 'ready' ? this.proxyUrl : undefined;
+    const key = `${signature(snapshot)}|${this.route ?? '/'}|${proxyUrl ?? ''}`;
     if (key === this.renderedKey) {
       return;
     }
     this.renderedKey = key;
-    view.webview.html = this.html(snapshot);
+
+    // Keep the reset nonce until it can be applied to a real iframe. During a
+    // server restart the pane first renders the "starting" screen, and
+    // consuming the nonce there would lose it before the new UI loads.
+    const reset = proxyUrl ? this.resetNonce : undefined;
+    if (reset) {
+      this.resetNonce = undefined;
+    }
+    this.bridgeReady = false;
+    this.requeueActiveAttach();
+    view.webview.html = this.html(snapshot, proxyUrl, reset);
   }
 
-  private html(snapshot: ServerSnapshot): string {
+  private html(
+    snapshot: ServerSnapshot,
+    proxyUrl: string | undefined,
+    reset: string | undefined,
+  ): string {
     const nonce = crypto.randomBytes(16).toString('base64');
-    const frameSource =
-      snapshot.status === 'ready' ? new URL(snapshot.info.url).origin : "'none'";
+    const frameSource = proxyUrl ? new URL(proxyUrl).origin : "'none'";
 
     const policy = [
       "default-src 'none'",
@@ -335,10 +664,38 @@ export class OpencodeViewProvider implements vscode.WebviewViewProvider {
 </style>
 </head>
 <body>
-${this.body(snapshot)}
+${this.body(snapshot, proxyUrl, reset)}
 <script nonce="${nonce}">
   (function () {
     const api = acquireVsCodeApi();
+    const frame = document.querySelector('iframe');
+    const targetOrigin = frame ? new URL(frame.src).origin : '';
+
+    function toFrame(message) {
+      if (!frame || !frame.contentWindow || !targetOrigin) return;
+      frame.contentWindow.postMessage(message, targetOrigin);
+    }
+
+    function hello() {
+      toFrame({ source: 'opencode-pane-host', type: 'hello' });
+    }
+
+    window.addEventListener('message', function (event) {
+      const data = event.data;
+      if (!data || typeof data !== 'object') return;
+
+      if (frame && event.source === frame.contentWindow) {
+        if (data.source === 'opencode-pane-bridge') {
+          api.postMessage(data);
+        }
+        return;
+      }
+
+      if (data.source === 'opencode-pane-host') {
+        toFrame(data);
+      }
+    });
+
     document.addEventListener('click', function (event) {
       const target = event.target;
       if (!(target instanceof Element)) return;
@@ -348,16 +705,36 @@ ${this.body(snapshot)}
       if (!action) return;
       api.postMessage({ type: action });
     });
+
+    if (frame) {
+      frame.addEventListener('load', hello);
+      hello();
+    }
   })();
 </script>
 </body>
 </html>`;
   }
 
-  private body(snapshot: ServerSnapshot): string {
+  private body(
+    snapshot: ServerSnapshot,
+    proxyUrl: string | undefined,
+    reset: string | undefined,
+  ): string {
     switch (snapshot.status) {
       case 'ready': {
-        const src = escapeHtml(iframeUrl(snapshot.info, this.route));
+        if (!proxyUrl) {
+          return `<div class="pane">
+  <div class="spinner" role="status" aria-label="Preparing"></div>
+  <h1>Preparing the opencode pane…</h1>
+  <p>The local keyboard and drag-and-drop bridge could not start.</p>
+  <div class="actions">
+    <button class="primary" data-action="retry">Retry</button>
+    <button data-action="logs">Show logs</button>
+  </div>
+</div>`;
+        }
+        const src = escapeHtml(iframeUrl(proxyUrl, snapshot.info, this.route, reset));
         return `<iframe src="${src}" allow="clipboard-read; clipboard-write; fullscreen" referrerpolicy="no-referrer" title="opencode"></iframe>`;
       }
       case 'starting':

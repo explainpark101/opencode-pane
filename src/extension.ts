@@ -28,6 +28,17 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  let lastEditor = vscode.window.activeTextEditor;
+  if (typeof vscode.window.onDidChangeActiveTextEditor === 'function') {
+    context.subscriptions.push(
+      vscode.window.onDidChangeActiveTextEditor((editor) => {
+        if (editor) {
+          lastEditor = editor;
+        }
+      }),
+    );
+  }
+
   const status = vscode.window.createStatusBarItem('opencode-pane.status', vscode.StatusBarAlignment.Right, 99);
   status.name = 'opencode';
   status.command = 'opencode-pane.open';
@@ -73,11 +84,85 @@ export function activate(context: vscode.ExtensionContext): void {
       const cwd = workspaceCwd();
       if (snapshot.info.cwd !== cwd) {
         log.appendLine(`[server] project changed (${snapshot.info.cwd} -> ${cwd}), restarting`);
+        provider.workspaceChanged();
         return server.restart();
       }
       return snapshot.info;
     }
     return server.start();
+  };
+
+  const createSession = async (info: ServerInfo): Promise<string> => {
+    const api = new OpencodeApi(info, log);
+    const session = await api.createSession(info.cwd);
+    return session.id;
+  };
+
+  /**
+   * Copies the mention to the clipboard and inserts it into the opencode
+   * composer. If the pane is not on a session yet, a session is created first.
+   */
+  const attachMention = async (mention: string): Promise<void> => {
+    await vscode.env.clipboard.writeText(mention);
+
+    let inserted = false;
+    try {
+      const info = await ensureServer();
+      await focusView();
+      inserted = await provider.attachText(mention);
+
+      if (!inserted && !provider.hasSessionRoute()) {
+        const sessionID = await createSession(info);
+        await provider.showSession(info, sessionID);
+        inserted = await provider.attachText(mention);
+      }
+    } catch (error) {
+      log.appendLine(`[command] attach failed: ${errorMessage(error)}`);
+    }
+
+    if (inserted) {
+      vscode.window.setStatusBarMessage(`opencode: ${mention} 첨부됨`, 6_000);
+    } else {
+      vscode.window.setStatusBarMessage(
+        `opencode: ${mention} 복사됨 — 패널 입력창에서 Ctrl+V`,
+        10_000,
+      );
+    }
+  };
+
+  const toMention = (fsPath: string): string => {
+    const normalized = path.normalize(fsPath);
+    const folders =
+      vscode.workspace.workspaceFolders?.filter((folder) => folder.uri.scheme === 'file') ?? [];
+
+    let best: string | undefined;
+    for (const folder of folders) {
+      const relative = path.relative(folder.uri.fsPath, normalized);
+      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+        continue;
+      }
+      if (!best || relative.length < best.length) {
+        best = relative;
+      }
+    }
+
+    const target = best ?? normalized;
+    return `@${target.split(path.sep).join('/')}`;
+  };
+
+  const attachPaths = async (paths: unknown): Promise<void> => {
+    const list = Array.isArray(paths)
+      ? paths.filter((item): item is string => typeof item === 'string' && item.length > 0)
+      : typeof paths === 'string' && paths.length > 0
+        ? [paths]
+        : [];
+
+    if (list.length === 0) {
+      void vscode.window.showWarningMessage('opencode: 첨부할 파일 경로가 없습니다.');
+      return;
+    }
+
+    await attachMention(list.map(toMention).join(' '));
   };
 
   const register = (id: string, handler: (...args: unknown[]) => unknown): void => {
@@ -91,8 +176,9 @@ export function activate(context: vscode.ExtensionContext): void {
   register('opencode-pane.newSession', async () => {
     try {
       const info = await ensureServer();
+      const sessionID = await createSession(info);
       await focusView();
-      provider.showRoute('/new-session');
+      await provider.showSession(info, sessionID);
       vscode.window.setStatusBarMessage(`opencode: ${path.basename(info.cwd)}에서 새 세션`, 5_000);
     } catch (error) {
       const detail = errorMessage(error);
@@ -102,7 +188,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   register('opencode-pane.attachSelection', async () => {
-    const editor = vscode.window.activeTextEditor;
+    const editor = vscode.window.activeTextEditor ?? lastEditor;
     if (!editor) {
       void vscode.window.showWarningMessage('opencode: 첨부할 편집기가 없습니다.');
       return;
@@ -122,17 +208,11 @@ export function activate(context: vscode.ExtensionContext): void {
       relative += start === end ? `#L${start}` : `#L${start}-${end}`;
     }
 
-    const mention = `@${relative}`;
-    await vscode.env.clipboard.writeText(mention);
+    await attachMention(`@${relative}`);
+  });
 
-    try {
-      await ensureServer();
-      await focusView();
-    } catch (error) {
-      log.appendLine(`[command] attach failed to start server: ${errorMessage(error)}`);
-    }
-
-    vscode.window.setStatusBarMessage(`opencode: ${mention} 복사됨 — 패널 입력창에서 Ctrl+V`, 8_000);
+  register('opencode-pane.attachPaths', async (paths) => {
+    await attachPaths(paths);
   });
 
   register('opencode-pane.reviewChanges', async () => {
@@ -206,10 +286,17 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   context.subscriptions.push(
+    provider.onDidDrop((paths) => {
+      void vscode.commands.executeCommand('opencode-pane.attachPaths', paths);
+    }),
+  );
+
+  context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(async () => {
       log.appendLine(`[server] workspace folders changed, target cwd is now ${workspaceCwd()}`);
       const snapshot = server.state;
       if (snapshot.status === 'ready' || snapshot.status === 'starting') {
+        provider.workspaceChanged();
         try {
           await server.restart();
         } catch (error) {
